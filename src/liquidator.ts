@@ -9,6 +9,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import "dotenv/config";
+import { notifyLiquidatable, notifyAtRisk, notifyExecuted, notify } from "./notify.js";
 
 const AAVE_POOL = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5" as Address;
 const PUBLIC_RPC = "https://mainnet.base.org";
@@ -159,6 +160,7 @@ async function main() {
 
   console.log(`Starting block: ${lastBlock}`);
   console.log(`Monitoring Aave V3 Base for liquidatable positions...\n`);
+  await notify(`🟢 <b>Liquidation bot started</b>\nChain: Base | Block: ${lastBlock}\nMode: ${walletClient ? "EXECUTION" : "monitor-only"}`);
 
   // Seed: scan last 200 blocks for borrowers
   console.log("Seeding borrower list (last 200 blocks)...");
@@ -190,14 +192,20 @@ async function main() {
       if (pos.healthFactor < 1.0) {
         liquidatable++;
         console.log(`\n🔴 [${new Date().toISOString()}] LIQUIDATABLE: ${addr.slice(0, 14)}.. HF=${pos.healthFactor.toFixed(4)} | $${pos.collateralUsd.toFixed(0)} coll | $${pos.debtUsd.toFixed(0)} debt`);
+        await notifyLiquidatable(addr, pos.healthFactor, pos.collateralUsd, pos.debtUsd);
 
         if (walletClient) {
-          await executeLiquidation(walletClient, publicClient, pos);
+          const success = await executeLiquidation(walletClient, publicClient, pos);
+          if (success) {
+            const profit = pos.collateralUsd * 0.5 * 0.05;
+            await notifyExecuted(addr, "pending", profit);
+          }
         }
       } else if (pos.healthFactor < 1.1) {
         atRisk++;
-        if (cycle % 10 === 1) { // log every 10th cycle to reduce noise
+        if (cycle % 10 === 1) {
           console.log(`🟡 [cycle ${cycle}] AT RISK: ${addr.slice(0, 14)}.. HF=${pos.healthFactor.toFixed(4)} | $${pos.debtUsd.toFixed(0)} debt`);
+          await notifyAtRisk(addr, pos.healthFactor, pos.debtUsd);
         }
       }
     }
