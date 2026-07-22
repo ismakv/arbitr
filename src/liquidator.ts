@@ -1,152 +1,64 @@
 import {
-  createPublicClient,
   createWalletClient,
   http,
-  formatEther,
-  parseAbi,
-  type Address,
+  type WalletClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { base } from "viem/chains";
+import { base, arbitrum } from "viem/chains";
 import "dotenv/config";
-import { notifyLiquidatable, notifyAtRisk, notifyExecuted, notify } from "./notify.js";
+import { notify, notifyLiquidatable, notifyAtRisk, notifyExecuted } from "./notify.js";
+import { type ProtocolMonitor, type Position } from "./protocols/types.js";
+import { createAaveMonitors } from "./protocols/aave.js";
+import { createMorphoMonitors } from "./protocols/morpho.js";
+import { createCompoundMonitors } from "./protocols/compound.js";
+import { getGasCostUsd, isProfitable, estimateLiquidationProfit } from "./utils/gas.js";
+import { getClient } from "./utils/rpc.js";
 
-const AAVE_POOL = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5" as Address;
-const PUBLIC_RPC = "https://mainnet.base.org";
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || "4000");
+const MIN_PROFIT_USD = Number(process.env.MIN_PROFIT_USD || "5");
 
-const POOL_ABI = parseAbi([
-  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
-  "function liquidationCall(address collateralAsset, address debtAsset, address user, uint256 debtToCover, bool receiveAToken) external",
-]);
+let running = true;
 
-const BORROW_TOPIC = "0xb3d084820fb1a9decffb176436bd02558d15fac9b0ddfed8c465bc7359d7dce0" as `0x${string}`;
-const LIQ_TOPIC = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286" as `0x${string}`;
+function setupGracefulShutdown() {
+  const shutdown = async (signal: string) => {
+    console.log(`\n[${signal}] Shutting down gracefully...`);
+    running = false;
+    await notify(`⚪ <b>Bot stopped</b> (${signal})`);
+    setTimeout(() => process.exit(0), 2000);
+  };
 
-// Aave V3 Base reserves (asset addresses)
-const RESERVES: Record<string, Address> = {
-  WETH: "0x4200000000000000000000000000000000000006",
-  USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  cbETH: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22",
-  cbBTC: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
-  USDbC: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
-  DAI: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",
-  AERO: "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
-};
-
-interface Position {
-  user: Address;
-  collateralUsd: number;
-  debtUsd: number;
-  healthFactor: number;
-}
-
-const POLL_BLOCKS = 5; // check every 5 blocks (~10s on Base)
-
-async function getActiveBorrowers(client: ReturnType<typeof createPublicClient>, fromBlock: bigint, toBlock: bigint): Promise<Set<string>> {
-  const userSet = new Set<string>();
-  try {
-    const logs = await client.getLogs({
-      address: AAVE_POOL,
-      topics: [BORROW_TOPIC],
-      fromBlock,
-      toBlock,
-    });
-    for (const l of logs) {
-      if (l.topics.length >= 3) {
-        userSet.add("0x" + l.topics[2].slice(26));
-      }
-    }
-  } catch { /* rate limited, skip */ }
-  return userSet;
-}
-
-async function checkPosition(client: ReturnType<typeof createPublicClient>, user: Address): Promise<Position | null> {
-  try {
-    const data = await client.readContract({
-      address: AAVE_POOL,
-      abi: POOL_ABI,
-      functionName: "getUserAccountData",
-      args: [user],
-    }) as bigint[];
-
-    const debtUsd = Number(data[1]) / 1e8;
-    if (debtUsd < 100) return null; // skip dust positions
-
-    return {
-      user,
-      collateralUsd: Number(data[0]) / 1e8,
-      debtUsd,
-      healthFactor: Number(formatEther(data[5])),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function executeLiquidation(
-  walletClient: ReturnType<typeof createWalletClient>,
-  publicClient: ReturnType<typeof createPublicClient>,
-  position: Position,
-): Promise<boolean> {
-  // Determine collateral and debt assets
-  // For simplicity, try WETH as collateral and USDC as debt (most common pair)
-  // In production: query userReserveData to find exact assets
-  const collateralAsset = RESERVES.WETH;
-  const debtAsset = RESERVES.USDC;
-
-  // Cover 50% of debt (max close factor for HF > 0.95)
-  const debtToCover = BigInt(Math.floor(position.debtUsd * 0.5)) * 10n ** 6n; // USDC 6 dec
-
-  console.log(`  ⚡ LIQUIDATING ${position.user.slice(0, 14)}...`);
-  console.log(`     Collateral: $${position.collateralUsd.toFixed(0)} | Debt: $${position.debtUsd.toFixed(0)} | HF: ${position.healthFactor.toFixed(4)}`);
-  console.log(`     Covering: $${(Number(debtToCover) / 1e6).toFixed(0)} of debt`);
-  console.log(`     Expected bonus: ~$${(position.collateralUsd * 0.5 * 0.05).toFixed(0)} (5% of seized collateral)`);
-
-  try {
-    const { request } = await publicClient.simulateContract({
-      address: AAVE_POOL,
-      abi: POOL_ABI,
-      functionName: "liquidationCall",
-      args: [collateralAsset, debtAsset, position.user, debtToCover, false],
-      account: walletClient.account!,
-    });
-
-    const txHash = await walletClient.writeContract(request);
-    console.log(`  ✅ Liquidation tx sent: ${txHash}`);
-
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-    if (receipt.status === "success") {
-      console.log(`  🎉 SUCCESS! Gas used: ${receipt.gasUsed}`);
-      return true;
-    } else {
-      console.log(`  ❌ Tx reverted`);
-      return false;
-    }
-  } catch (err) {
-    console.log(`  ❌ Liquidation failed: ${err instanceof Error ? err.message.slice(0, 120) : err}`);
-    return false;
-  }
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 async function main() {
-  console.log("╔═══════════════════════════════════════════╗");
-  console.log("║   Aave V3 Liquidation Bot (Base)         ║");
-  console.log("╚═══════════════════════════════════════════╝\n");
+  console.log("╔═══════════════════════════════════════════════╗");
+  console.log("║  Multi-Protocol Liquidation Bot v2.0         ║");
+  console.log("║  Aave V3 + Morpho Blue + Compound V3         ║");
+  console.log("║  Chains: Base + Arbitrum                     ║");
+  console.log("╚═══════════════════════════════════════════════╝\n");
 
-  const publicClient = createPublicClient({
-    chain: base,
-    transport: http(PUBLIC_RPC),
-  });
+  setupGracefulShutdown();
 
+  // Initialize all protocol monitors
+  const monitors: ProtocolMonitor[] = [
+    ...createAaveMonitors(),
+    ...createMorphoMonitors(),
+    ...createCompoundMonitors(),
+  ];
+
+  console.log(`Protocols: ${monitors.map((m) => `${m.name} (${m.chain})`).join(", ")}`);
+
+  // Wallet setup
   const privateKey = process.env.PRIVATE_KEY;
-  let walletClient: ReturnType<typeof createWalletClient> | null = null;
+  let walletClient: WalletClient | null = null;
 
   if (privateKey) {
     const account = privateKeyToAccount(privateKey as `0x${string}`);
     walletClient = createWalletClient({
       account,
       chain: base,
-      transport: http(PUBLIC_RPC),
+      transport: http(process.env.BASE_RPC_HTTPS || "https://mainnet.base.org"),
     });
     console.log(`Wallet: ${account.address}`);
     console.log("Mode: EXECUTION ENABLED\n");
@@ -154,67 +66,116 @@ async function main() {
     console.log("No PRIVATE_KEY — monitor-only mode\n");
   }
 
-  // Track known borrowers (accumulated over time)
-  const knownBorrowers = new Set<string>();
-  let lastBlock = await publicClient.getBlockNumber();
+  await notify(
+    `🟢 <b>Liquidation bot v2.0 started</b>\n` +
+    `Protocols: ${monitors.length} (Aave, Morpho, Compound)\n` +
+    `Chains: Base + Arbitrum\n` +
+    `Mode: ${walletClient ? "EXECUTION" : "monitor-only"}\n` +
+    `Poll: ${POLL_INTERVAL_MS}ms`,
+  );
 
-  console.log(`Starting block: ${lastBlock}`);
-  console.log(`Monitoring Aave V3 Base for liquidatable positions...\n`);
-  await notify(`🟢 <b>Liquidation bot started</b>\nChain: Base | Block: ${lastBlock}\nMode: ${walletClient ? "EXECUTION" : "monitor-only"}`);
+  // Alert deduplication (don't spam for same position)
+  const alertedPositions = new Map<string, number>();
+  const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
 
-  // Seed: scan last 200 blocks for borrowers
-  console.log("Seeding borrower list (last 200 blocks)...");
-  const seedUsers = await getActiveBorrowers(publicClient, lastBlock - 200n, lastBlock);
-  for (const u of seedUsers) knownBorrowers.add(u);
-  console.log(`Found ${knownBorrowers.size} borrowers\n`);
-
-  // Main loop
   let cycle = 0;
+  let totalLiquidatable = 0;
+  let totalExecuted = 0;
+  let totalProfitUsd = 0;
+
   const loop = async () => {
+    if (!running) return;
     cycle++;
-    const currentBlock = await publicClient.getBlockNumber();
 
-    if (currentBlock > lastBlock) {
-      // Discover new borrowers
-      const newUsers = await getActiveBorrowers(publicClient, lastBlock, currentBlock);
-      for (const u of newUsers) knownBorrowers.add(u);
-      lastBlock = currentBlock;
-    }
+    try {
+      // Scan all protocols concurrently
+      const scanResults = await Promise.allSettled(
+        monitors.map((m) => m.scan()),
+      );
 
-    // Check all known positions
-    let atRisk = 0;
-    let liquidatable = 0;
+      let allPositions: Position[] = [];
+      let atRiskCount = 0;
+      let liquidatableCount = 0;
 
-    for (const addr of knownBorrowers) {
-      const pos = await checkPosition(publicClient, addr as Address);
-      if (!pos) continue;
-
-      if (pos.healthFactor < 1.0) {
-        liquidatable++;
-        console.log(`\n🔴 [${new Date().toISOString()}] LIQUIDATABLE: ${addr.slice(0, 14)}.. HF=${pos.healthFactor.toFixed(4)} | $${pos.collateralUsd.toFixed(0)} coll | $${pos.debtUsd.toFixed(0)} debt`);
-        await notifyLiquidatable(addr, pos.healthFactor, pos.collateralUsd, pos.debtUsd);
-
-        if (walletClient) {
-          const success = await executeLiquidation(walletClient, publicClient, pos);
-          if (success) {
-            const profit = pos.collateralUsd * 0.5 * 0.05;
-            await notifyExecuted(addr, "pending", profit);
-          }
-        }
-      } else if (pos.healthFactor < 1.1) {
-        atRisk++;
-        if (cycle % 10 === 1) {
-          console.log(`🟡 [cycle ${cycle}] AT RISK: ${addr.slice(0, 14)}.. HF=${pos.healthFactor.toFixed(4)} | $${pos.debtUsd.toFixed(0)} debt`);
-          await notifyAtRisk(addr, pos.healthFactor, pos.debtUsd);
+      for (let i = 0; i < scanResults.length; i++) {
+        const r = scanResults[i];
+        if (r.status === "fulfilled") {
+          allPositions = allPositions.concat(r.value);
         }
       }
+
+      // Process positions
+      for (const pos of allPositions) {
+        const key = `${pos.protocol}-${pos.chain}-${pos.user}`;
+
+        if (pos.healthFactor < 1.0) {
+          liquidatableCount++;
+          totalLiquidatable++;
+
+          const lastAlert = alertedPositions.get(key) || 0;
+          if (Date.now() - lastAlert > ALERT_COOLDOWN_MS) {
+            alertedPositions.set(key, Date.now());
+
+            console.log(
+              `\n🔴 [${new Date().toISOString()}] ${pos.protocol} (${pos.chain})\n` +
+              `   User: ${pos.user.slice(0, 16)}.. | HF=${pos.healthFactor.toFixed(4)}\n` +
+              `   Collateral: $${pos.collateralUsd.toFixed(0)} | Debt: $${pos.debtUsd.toFixed(0)}`,
+            );
+
+            await notifyLiquidatable(pos.user, pos.healthFactor, pos.collateralUsd, pos.debtUsd);
+
+            // Execute if wallet available
+            if (walletClient) {
+              const client = await getClient(pos.chain);
+              const gasCostUsd = await getGasCostUsd(client, pos.chain);
+              const bonusUsd = estimateLiquidationProfit(pos.collateralUsd);
+
+              if (isProfitable(bonusUsd, gasCostUsd, MIN_PROFIT_USD)) {
+                console.log(`   ⚡ Executing (profit ~$${bonusUsd.toFixed(0)}, gas ~$${gasCostUsd.toFixed(2)})`);
+                const monitor = monitors.find((m) => m.name === pos.protocol && m.chain === pos.chain);
+                if (monitor) {
+                  const result = await monitor.liquidate(pos, walletClient);
+                  if (result.success) {
+                    totalExecuted++;
+                    totalProfitUsd += result.profitUsd || 0;
+                    console.log(`   🎉 SUCCESS tx=${result.txHash} profit~$${result.profitUsd?.toFixed(0)}`);
+                    await notifyExecuted(pos.user, result.txHash || "", result.profitUsd || 0);
+                  } else {
+                    console.log(`   ❌ FAILED: ${result.error}`);
+                  }
+                }
+              } else {
+                console.log(`   ⏭️ Skip: profit $${bonusUsd.toFixed(0)} < gas $${gasCostUsd.toFixed(2)} + min $${MIN_PROFIT_USD}`);
+              }
+            }
+          }
+        } else if (pos.healthFactor < 1.1) {
+          atRiskCount++;
+          const lastAlert = alertedPositions.get(key) || 0;
+          if (Date.now() - lastAlert > ALERT_COOLDOWN_MS && cycle % 10 === 1) {
+            alertedPositions.set(key, Date.now());
+            console.log(`🟡 ${pos.protocol} (${pos.chain}) AT RISK: ${pos.user.slice(0, 14)}.. HF=${pos.healthFactor.toFixed(4)} | $${pos.debtUsd.toFixed(0)} debt`);
+            await notifyAtRisk(pos.user, pos.healthFactor, pos.debtUsd);
+          }
+        }
+      }
+
+      // Periodic status
+      if (cycle % 30 === 0) {
+        const borrowerInfo = monitors
+          .filter((m) => "borrowerCount" in m)
+          .map((m) => `${m.name}(${m.chain}):${(m as any).borrowerCount}`)
+          .join(" ");
+        console.log(
+          `[cycle ${cycle}] positions=${allPositions.length} | atRisk=${atRiskCount} | ` +
+          `liquidatable=${liquidatableCount} | executed=${totalExecuted} | profit=$${totalProfitUsd.toFixed(0)} | ${borrowerInfo}`,
+        );
+      }
+    } catch (err) {
+      console.error(`[cycle ${cycle}] Error: ${err instanceof Error ? err.message : err}`);
     }
 
-    if (cycle % 30 === 0) {
-      console.log(`[cycle ${cycle}] block=${currentBlock} | borrowers=${knownBorrowers.size} | atRisk=${atRisk} | liquidatable=${liquidatable}`);
-    }
-
-    setTimeout(loop, 4000); // ~2 blocks on Base
+    if (running) setTimeout(loop, POLL_INTERVAL_MS);
   };
 
   await loop();

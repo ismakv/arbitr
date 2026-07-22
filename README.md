@@ -1,82 +1,89 @@
-# Arbitr — DEX-DEX Arbitrage Bot
+# Arbitr — Multi-Protocol Liquidation Bot
 
-Автоматический арбитражный бот для Base / Arbitrum / Monad.
+Автоматический ликвидационный бот для Aave V3, Morpho Blue, Compound V3 на Base + Arbitrum.
 
-## Стратегия
+## Протоколы
 
-2-hop DEX-DEX арбитраж: купить токен на DEX A → продать на DEX B.
-Поддержка двух режимов исполнения:
-- **direct** — прямой капитал (2 свапа подряд)
-- **flashloan** — flash loan через Aave V3 (нулевой капитал)
+| Протокол | Base | Arbitrum | Ликвидация | Бонус |
+|----------|------|----------|------------|-------|
+| Aave V3 | ✅ | ✅ | `liquidationCall()` | 5% |
+| Morpho Blue | ✅ | ✅ | `liquidate()` | 5-10% |
+| Compound V3 | ✅ | ✅ | `absorb()` | 5-8% |
 
 ## Быстрый старт
 
 ```bash
 npm install
-cp .env.example .env   # заполнить RPC + PRIVATE_KEY
-npm run dev            # monitor-only mode (без ключа)
-npm start              # production mode
+cp .env.example .env
+npm run dev          # monitor-only (без ключа)
+```
+
+## Env переменные
+
+| Переменная | Описание |
+|---|---|
+| `PRIVATE_KEY` | Ключ кошелька (без него = monitor-only) |
+| `TELEGRAM_BOT_TOKEN` | Токен Telegram бота |
+| `TELEGRAM_CHAT_ID` | Chat ID для алертов |
+| `BASE_RPC_HTTPS` | RPC для Base (default: public) |
+| `ARBITRUM_RPC_HTTPS` | RPC для Arbitrum (default: public) |
+| `INFURA_KEY` | Infura API key (fallback RPC) |
+| `POLL_INTERVAL_MS` | Интервал опроса (default: 4000) |
+| `MIN_PROFIT_USD` | Мин. профит для исполнения (default: 5) |
+
+## Telegram алерты
+
+- 🟢 бот запущен
+- 🟡 позиция на грани (HF < 1.1)
+- 🔴 можно ликвидировать (HF < 1.0)
+- 🎉 ликвидация исполнена
+- ⚪ бот остановлен
+
+## Деплой
+
+```bash
+# Docker
+docker build -t arbitr-liq-bot .
+docker run -d --name arbitr-liq-bot --restart unless-stopped \
+  -e TELEGRAM_BOT_TOKEN=... \
+  -e TELEGRAM_CHAT_ID=... \
+  arbitr-liq-bot
+
+# Coolify (github.com/ismakv/arbitr)
+# Server: 93.183.93.3
 ```
 
 ## Структура
 
 ```
 src/
-├── index.ts              — главный цикл (poll → detect → execute)
-├── config.ts             — конфиги цепей, DEX, токенов
-├── types.ts              — общие типы
-├── providers.ts          — viem clients (HTTP/WS)
-├── logger.ts             — логгер
-├── executor.ts           — direct capital исполнение
-├── dex/
-│   └── quoter.ts         — котировки V2/V3 через multicall
-├── strategy/
-│   ├── arbitrage.ts      — детект 2-hop арбитража
-│   └── arbitrage.test.ts — юнит-тесты
-└── execution/
-    └── flashloan.ts      — flash loan исполнение (Aave V3)
-
-contracts/
-└── FlashArb.sol          — Solidity контракт для flash loan арбитража
+├── liquidator.ts         — оркестратор (multi-protocol, multi-chain)
+├── notify.ts             — Telegram уведомления
+├── protocols/
+│   ├── types.ts          — общие типы
+│   ├── aave.ts           — Aave V3 (Base + Arbitrum)
+│   ├── morpho.ts         — Morpho Blue (Base + Arbitrum)
+│   └── compound.ts       — Compound V3 (Base + Arbitrum)
+├── utils/
+│   ├── rpc.ts            — fallback RPC, rate limiting
+│   └── gas.ts            — gas estimation, profitability check
+├── dex/                  — DEX quoter (арбитраж, не используется в liq mode)
+├── strategy/             — 2-hop арбитраж стратегия
+├── mempool/              — mempool monitor (требует WSS)
+└── execution/            — flash loan исполнение
 ```
 
-## Конфигурация (.env)
+## Как работает
 
-| Переменная | Описание |
-|---|---|
-| `BASE_RPC_WSS` | WebSocket RPC для Base |
-| `BASE_RPC_HTTPS` | HTTP RPC для Base |
-| `PRIVATE_KEY` | Приватный ключ кошелька |
-| `MIN_PROFIT_USD` | Минимальный профит для исполнения |
-| `MAX_GAS_GWEI` | Максимальная цена газа |
-| `POLL_INTERVAL_MS` | Интервал опроса (мс) |
-| `EXECUTION_MODE` | `direct` или `flashloan` |
-| `TRADE_AMOUNT_ETH` | Размер сделки (ETH) |
-| `ACTIVE_CHAIN` | `base` / `arbitrum` |
+1. Каждые 4 сек сканирует ВСЕ протоколы параллельно (Promise.all)
+2. Для каждого: находит заёмщиков через event logs → проверяет Health Factor
+3. При HF < 1.0: шлёт Telegram алерт + (если есть ключ) исполняет ликвидацию
+4. Перед исполнением: проверяет gas cost < profit
+5. Rate limiting: не более 5 req/s на RPC endpoint
+6. Fallback RPC: если Infura упала → drpc.org → 1rpc.io → public
 
 ## Тесты
 
 ```bash
-npm test
+npm test   # vitest (стратегия арбитража)
 ```
-
-## Деплой FlashArb (для режима flashloan)
-
-1. Установить Foundry: `curl -L https://foundry.paradigm.xyz | bash`
-2. Скомпилировать: `forge build`
-3. Задеплоить: `forge create contracts/FlashArb.sol:FlashArb --constructor-args <AAVE_POOL> --rpc-url <RPC> --private-key <KEY>`
-4. Вписать адрес в `src/execution/flashloan.ts` → `FLASH_ARB_ADDRESS`
-
-## Roadmap
-
-- [x] Scaffold + конфиг
-- [x] V2/V3 котировки
-- [x] 2-hop стратегия
-- [x] Direct execution
-- [x] Flash loan контракт
-- [ ] Multicall3 батчинг (оптимизация RPC)
-- [ ] Mempool monitoring (pending tx)
-- [ ] 3-hop + triangular арбитраж
-- [ ] Monad интеграция
-- [ ] Flashbots / private tx pool
-- [ ] Dashboard / Telegram алерты
