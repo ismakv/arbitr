@@ -5,12 +5,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY tsconfig.json ./
-COPY src ./src
-
-RUN npx tsc
-RUN npm prune --omit=dev
+COPY . .
 
 ENV NODE_ENV=production
 
-CMD ["node", "dist/liquidator.js"]
+CMD ["npx", "tsx", "src/liquidator.ts"]

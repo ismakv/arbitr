@@ -236,7 +236,7 @@ async function paperTrade(durationSec: number) {
 }
 
 async function main() {
-  const client = createPublicClient({ chain: base, transport: http(PUBLIC_RPC) });
+  const client = createPublicClient({ chain: base, transport: http(PUBLIC_RPC) }) as any;
 
   await analyzeRecentLiquidations(client);
   await paperTrade(120); // 2 minutes paper trading
